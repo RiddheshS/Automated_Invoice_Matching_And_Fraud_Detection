@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+scikit-learn
+plotly
+sqlalchemy
+thefuzz
+pdfplumber
+python-docx
+Pillow
+pytesseract
+python-multipart
