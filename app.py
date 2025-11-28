@@ -9,14 +9,7 @@ from sklearn.ensemble import IsolationForest
 import re
 import pdfplumber
 import docx
-from PIL import Image
 import io
-
-try:
-    import pytesseract
-    HAS_OCR = True
-except ImportError:
-    HAS_OCR = False
 
 try:
     from thefuzz import fuzz
@@ -25,9 +18,9 @@ except ImportError:
     HAS_FUZZ = False
 
 st.set_page_config(
-    page_title="Invoice Sentinel | Smart Document AI",
+    page_title="Invoice Sentinel | Fast Mode",
     layout="wide",
-    page_icon="🛡️"
+    page_icon="⚡"
 )
 
 st.markdown("""
@@ -48,7 +41,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 Base = declarative_base()
-engine = create_engine('sqlite:///invoice_sentinel_ai_v3.db')
+engine = create_engine('sqlite:///invoice_sentinel_fast.db')
 Session = sessionmaker(bind=engine)
 session = Session()
 
@@ -100,11 +93,7 @@ def extract_text_from_file(uploaded_file):
             for para in doc.paragraphs:
                 text += para.text + "\n"
         elif file_type in ['png', 'jpg', 'jpeg']:
-            if HAS_OCR:
-                image = Image.open(uploaded_file)
-                text = pytesseract.image_to_string(image)
-            else:
-                return "OCR_MISSING"
+            return "IMAGE_SKIPPED"
     except Exception as e:
         return f"Error: {e}"
     return text
@@ -113,25 +102,19 @@ def smart_parse_text(text, doc_type):
     data = {}
     text_lower = text.lower()
     
-    # --- UPDATED REGEX ENGINE ---
     if doc_type == 'invoice':
-        # 1. Invoice ID
         pattern = r'(?:invoice\s*(?:no|number|#|id)|inv\.|inv)\s*[:.]?\s*([a-zA-Z0-9\-_]+)'
         match = re.search(pattern, text_lower)
         data['Invoice_ID'] = match.group(1).upper() if match else "UNKNOWN-INV"
         
-        # 2. PO Number (The "Catch-All" Pattern)
-        # Matches: "PO Number", "PO #", "PO Reference", "PO Ref", "Reference No", "Ref #"
         po_pattern = r'(?:po|purchase\s*order|reference|ref\.?)\s*(?:no\.?|number|#|id|ref\.?|reference)?\s*[:.-]?\s*([a-zA-Z0-9\-_]+)'
         po_match = re.search(po_pattern, text_lower)
         data['PO_Number'] = po_match.group(1).upper() if po_match else "MISSING-PO"
 
     elif doc_type == 'po':
-        # PO Document ID
         pattern = r'(?:po|purchase\s*order|order)\s*(?:no\.?|number|#|id)?\s*[:.-]?\s*([a-zA-Z0-9\-_]+)'
         match = re.search(pattern, text_lower)
         data['PO_Number'] = match.group(1).upper() if match else "UNKNOWN-PO"
-    # ----------------------------
 
     amounts = re.findall(r'[₹$€]?\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', text)
     if amounts:
@@ -167,17 +150,14 @@ def match_logic_only(df_invoices, df_pos):
     for _, inv in df_invoices.iterrows():
         match_status = "Unmatched"
         notes = []
-        
         inv_po = str(inv.get('PO_Number', '')).strip().upper()
-        
         po_match = df_pos[df_pos['PO_Number'].astype(str).str.strip().str.upper() == inv_po]
         
         if po_match.empty:
             match_status = "Missing PO"
-            notes.append("PO ID not found in database.")
+            notes.append("PO ID not found.")
         else:
             po = po_match.iloc[0]
-            
             try:
                 inv_amt = float(inv['Amount'])
                 po_amt = float(po['Amount'])
@@ -187,7 +167,7 @@ def match_logic_only(df_invoices, df_pos):
             
             if diff > 0.01:
                 match_status = "Discrepancy"
-                notes.append(f"Invoice exceeds PO by ₹{diff:,.2f}")
+                notes.append(f"Exceeds PO by ₹{diff:,.2f}")
             elif diff < -0.01:
                 match_status = "Underbilled"
             else:
@@ -203,7 +183,6 @@ def match_logic_only(df_invoices, df_pos):
                 is_match = True
                 
             if not is_match:
-                notes.append(f"Vendor mismatch detected.")
                 if match_status == "Matched": match_status = "Vendor Mismatch"
 
         results.append({
@@ -220,7 +199,6 @@ def anomaly_logic_only(df_matched):
     if df_matched.empty or len(df_matched) < 5:
         df_matched['Anomaly_Status'] = "Insufficient Data"
         return df_matched
-        
     model = IsolationForest(contamination=0.1, random_state=42)
     X = df_matched['Amount'].values.reshape(-1, 1)
     df_matched['Anomaly_Score'] = model.fit_predict(X)
@@ -228,11 +206,10 @@ def anomaly_logic_only(df_matched):
     return df_matched
 
 def sidebar_nav():
-    st.sidebar.title("🛡️ Invoice Sentinel")
+    st.sidebar.title("⚡ Invoice Sentinel Lite")
     st.sidebar.markdown("---")
-    page = st.sidebar.radio("Navigation", ["Dashboard", "Smart Upload (PDF/Img)", "Reconciliation"])
-    st.sidebar.markdown("---")
-    st.sidebar.info("System: AI Parser Enabled\nSupports: PDF, DOCX, PNG, JPG, CSV")
+    page = st.sidebar.radio("Navigation", ["Dashboard", "Document Upload (PDF/DOCX)", "Reconciliation"])
+    st.sidebar.info("Mode: Fast Cloud Deploy\nNo Image OCR")
     return page
 
 def page_dashboard():
@@ -242,7 +219,6 @@ def page_dashboard():
     col2.metric("Discrepancies", "45", "-5%")
     col3.metric("Fraud Alerts", "8", "High Risk", delta_color="inverse")
     col4.metric("Value at Risk", "₹ 12,45,000", "Alert")
-    
     st.markdown("---")
     c1, c2 = st.columns(2)
     with c1:
@@ -258,67 +234,55 @@ def page_dashboard():
         st.plotly_chart(fig2, use_container_width=True)
 
 def page_entry():
-    st.title("Smart Document Ingestion")
+    st.title("Document Ingestion (PDF/Word/CSV)")
     
-    tab1, tab2 = st.tabs(["📄 Document Upload (PDF/Img/Doc)", "📂 CSV Batch Upload"])
+    tab1, tab2 = st.tabs(["📄 Document Parser", "📂 CSV Batch Upload"])
     
     with tab1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("AI Document Parser")
-        st.info("Upload raw PDF, Word, or Image files. The AI extracts Invoice IDs, PO References, and Amounts.")
+        st.subheader("Smart Document Parser (No Images)")
+        st.info("Upload PDF or Word files only.")
         
         c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### 📥 Vendor Invoices")
-            inv_files = st.file_uploader("Drop PDFs/Images here", type=['pdf', 'docx', 'png', 'jpg'], accept_multiple_files=True, key="inv_doc")
-        with c2:
-            st.markdown("### 📋 Purchase Orders")
-            po_files = st.file_uploader("Drop PDFs/Images here", type=['pdf', 'docx', 'png', 'jpg'], accept_multiple_files=True, key="po_doc")
+        inv_files = c1.file_uploader("Upload Invoices (PDF/DOCX)", type=['pdf', 'docx', 'doc'], accept_multiple_files=True)
+        po_files = c2.file_uploader("Upload POs (PDF/DOCX)", type=['pdf', 'docx', 'doc'], accept_multiple_files=True)
             
-        if st.button("🚀 Extract & Analyze Documents"):
+        if st.button("🚀 Extract & Analyze"):
             if not inv_files or not po_files:
                 st.error("Please upload at least one Invoice and one PO.")
             else:
                 extracted_inv = []
-                with st.spinner("Scanning Invoices..."):
-                    for f in inv_files:
-                        raw_text = extract_text_from_file(f)
-                        if raw_text == "OCR_MISSING":
-                            st.warning(f"Could not scan image {f.name}. Install Tesseract-OCR.")
-                            continue
-                        elif raw_text.startswith("Error"):
-                            st.error(f"Failed to read {f.name}")
-                            continue
-                        data = smart_parse_text(raw_text, 'invoice')
-                        data['Source_File'] = f.name
-                        extracted_inv.append(data)
+                for f in inv_files:
+                    raw_text = extract_text_from_file(f)
+                    if raw_text == "IMAGE_SKIPPED":
+                        st.warning(f"Skipped {f.name} (Image/OCR disabled in Lite Mode)")
+                        continue
+                    data = smart_parse_text(raw_text, 'invoice')
+                    data['Source_File'] = f.name
+                    extracted_inv.append(data)
                 
                 extracted_po = []
-                with st.spinner("Scanning POs..."):
-                    for f in po_files:
-                        raw_text = extract_text_from_file(f)
-                        data = smart_parse_text(raw_text, 'po')
-                        data['Source_File'] = f.name
-                        extracted_po.append(data)
+                for f in po_files:
+                    raw_text = extract_text_from_file(f)
+                    data = smart_parse_text(raw_text, 'po')
+                    data['Source_File'] = f.name
+                    extracted_po.append(data)
                 
-                df_inv = pd.DataFrame(extracted_inv)
-                df_po = pd.DataFrame(extracted_po)
-                
-                st.session_state['df_inv'] = df_inv
-                st.session_state['df_po'] = df_po
-                st.success("Data extracted successfully!")
-                
-                st.write("Invoices:", df_inv.head())
-                st.write("POs:", df_po.head())
-                st.success("Proceed to Reconciliation Tab.")
-                
+                if extracted_inv and extracted_po:
+                    df_inv = pd.DataFrame(extracted_inv)
+                    df_po = pd.DataFrame(extracted_po)
+                    st.session_state['df_inv'] = df_inv
+                    st.session_state['df_po'] = df_po
+                    st.success("Extraction Complete!")
+                    st.write("Invoices:", df_inv.head())
+                    st.write("POs:", df_po.head())
+                else:
+                    st.error("No valid text found in documents.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with tab2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Legacy CSV Upload")
-        st.caption("Auto-cleans column names.")
-        
         c1, c2 = st.columns(2)
         inv_files = c1.file_uploader("Upload Invoice CSVs", type=['csv'], accept_multiple_files=True, key='csv_inv')
         po_files = c2.file_uploader("Upload PO CSVs", type=['csv'], accept_multiple_files=True, key='csv_po')
@@ -327,7 +291,6 @@ def page_entry():
             try:
                 df_inv = pd.concat((pd.read_csv(f, encoding='utf-8-sig') for f in inv_files), ignore_index=True)
                 df_po = pd.concat((pd.read_csv(f, encoding='utf-8-sig') for f in po_files), ignore_index=True)
-                
                 df_inv = clean_dataframe(df_inv, 'invoice')
                 df_po = clean_dataframe(df_po, 'po')
                 
@@ -349,26 +312,22 @@ def page_entry():
 
 def page_analysis():
     st.title("Reconciliation & Analysis")
-    
     if 'df_inv' not in st.session_state or 'df_po' not in st.session_state:
         st.warning("No data found. Please upload documents first.")
         return
-
     df_inv = st.session_state['df_inv']
     df_po = st.session_state['df_po']
-
     st.markdown("### Step 1: Matching Results")
     if st.button("Run Matching Engine"):
         matched = match_logic_only(df_inv, df_po)
         if not matched.empty:
             st.session_state['matched'] = matched
-            
             def color_status(val):
                 color = 'green' if val == 'Matched' else 'red'
                 return f'color: {color}; font-weight: bold'
             st.dataframe(matched.style.applymap(color_status, subset=['Match_Status']))
         else:
-            st.warning("No matches found or missing required columns.")
+            st.warning("No matches found.")
 
     st.markdown("---")
     st.markdown("### Step 2: AI Fraud Detection")
@@ -380,7 +339,7 @@ def page_analysis():
 def main():
     page = sidebar_nav()
     if page == "Dashboard": page_dashboard()
-    elif page == "Smart Upload (PDF/Img)": page_entry()
+    elif page == "Document Upload (PDF/DOCX)": page_entry()
     elif page == "Reconciliation": page_analysis()
 
 if __name__ == "__main__":
