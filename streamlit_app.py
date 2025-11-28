@@ -6,10 +6,6 @@ import plotly.graph_objects as go
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sklearn.ensemble import IsolationForest
-import re
-import pdfplumber
-import docx
-import io
 
 try:
     from thefuzz import fuzz
@@ -18,9 +14,9 @@ except ImportError:
     HAS_FUZZ = False
 
 st.set_page_config(
-    page_title="Invoice Sentinel | Fast Mode",
+    page_title="Invoice Sentinel | Enterprise Edition",
     layout="wide",
-    page_icon="⚡"
+    page_icon="🛡️"
 )
 
 st.markdown("""
@@ -41,7 +37,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 Base = declarative_base()
-engine = create_engine('sqlite:///invoice_sentinel_fast.db')
+engine = create_engine('sqlite:///invoice_sentinel_simple.db')
 Session = sessionmaker(bind=engine)
 session = Session()
 
@@ -80,62 +76,24 @@ def clean_dataframe(df, type_name):
         df = standardize_columns(df, 'Amount', ['Line Total', 'Total Amount', 'Value', 'Amount', 'Total'])
     return df
 
-def extract_text_from_file(uploaded_file):
-    text = ""
-    file_type = uploaded_file.name.split('.')[-1].lower()
+def process_uploaded_data(df, id_col, file_type):
+    if id_col not in df.columns:
+        st.error(f"❌ Missing Column: The {file_type} file is missing '{id_col}'. Found: {list(df.columns)}")
+        return pd.DataFrame()
+
     try:
-        if file_type == 'pdf':
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() + "\n"
-        elif file_type in ['docx', 'doc']:
-            doc = docx.Document(uploaded_file)
-            for para in doc.paragraphs:
-                text += para.text + "\n"
-        elif file_type in ['png', 'jpg', 'jpeg']:
-            return "IMAGE_SKIPPED"
-    except Exception as e:
-        return f"Error: {e}"
-    return text
+        df['Amount'] = df['Amount'].astype(str).str.replace(',', '').str.replace('₹', '').astype(float)
+    except:
+        df['Amount'] = 0.0
 
-def smart_parse_text(text, doc_type):
-    data = {}
-    text_lower = text.lower()
-    
-    if doc_type == 'invoice':
-        pattern = r'(?:invoice\s*(?:no|number|#|id)|inv\.|inv)\s*[:.]?\s*([a-zA-Z0-9\-_]+)'
-        match = re.search(pattern, text_lower)
-        data['Invoice_ID'] = match.group(1).upper() if match else "UNKNOWN-INV"
+    if df[id_col].duplicated().any():
+        st.info(f"ℹ️ {file_type}: Aggregating multiple line items automatically.")
+        group_cols = [id_col]
+        if 'Vendor' in df.columns: group_cols.append('Vendor')
+        if 'PO_Number' in df.columns and id_col != 'PO_Number': group_cols.append('PO_Number')
+        df = df.groupby(group_cols, as_index=False)['Amount'].sum()
         
-        po_pattern = r'(?:po|purchase\s*order|reference|ref\.?)\s*(?:no\.?|number|#|id|ref\.?|reference)?\s*[:.-]?\s*([a-zA-Z0-9\-_]+)'
-        po_match = re.search(po_pattern, text_lower)
-        data['PO_Number'] = po_match.group(1).upper() if po_match else "MISSING-PO"
-
-    elif doc_type == 'po':
-        pattern = r'(?:po|purchase\s*order|order)\s*(?:no\.?|number|#|id)?\s*[:.-]?\s*([a-zA-Z0-9\-_]+)'
-        match = re.search(pattern, text_lower)
-        data['PO_Number'] = match.group(1).upper() if match else "UNKNOWN-PO"
-
-    amounts = re.findall(r'[₹$€]?\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', text)
-    if amounts:
-        clean_amounts = []
-        for a in amounts:
-            try:
-                clean_amounts.append(float(a.replace(',', '')))
-            except: pass
-        data['Amount'] = max(clean_amounts) if clean_amounts else 0.0
-    else:
-        data['Amount'] = 0.0
-
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    vendor_pattern = r'(?:vendor|supplier|from|bill\s*to)\s*[:.]?\s*(.*)'
-    vendor_match = re.search(vendor_pattern, text_lower)
-    if vendor_match:
-        data['Vendor'] = vendor_match.group(1).title().strip()
-    else:
-        data['Vendor'] = lines[0] if lines else "Unknown Vendor"
-
-    return data
+    return df
 
 def match_logic_only(df_invoices, df_pos):
     results = []
@@ -155,7 +113,7 @@ def match_logic_only(df_invoices, df_pos):
         
         if po_match.empty:
             match_status = "Missing PO"
-            notes.append("PO ID not found.")
+            notes.append("PO ID not found in database.")
         else:
             po = po_match.iloc[0]
             try:
@@ -167,7 +125,7 @@ def match_logic_only(df_invoices, df_pos):
             
             if diff > 0.01:
                 match_status = "Discrepancy"
-                notes.append(f"Exceeds PO by ₹{diff:,.2f}")
+                notes.append(f"Invoice exceeds PO by ₹{diff:,.2f}")
             elif diff < -0.01:
                 match_status = "Underbilled"
             else:
@@ -183,6 +141,7 @@ def match_logic_only(df_invoices, df_pos):
                 is_match = True
                 
             if not is_match:
+                notes.append(f"Vendor mismatch detected.")
                 if match_status == "Matched": match_status = "Vendor Mismatch"
 
         results.append({
@@ -199,6 +158,7 @@ def anomaly_logic_only(df_matched):
     if df_matched.empty or len(df_matched) < 5:
         df_matched['Anomaly_Status'] = "Insufficient Data"
         return df_matched
+        
     model = IsolationForest(contamination=0.1, random_state=42)
     X = df_matched['Amount'].values.reshape(-1, 1)
     df_matched['Anomaly_Score'] = model.fit_predict(X)
@@ -206,19 +166,21 @@ def anomaly_logic_only(df_matched):
     return df_matched
 
 def sidebar_nav():
-    st.sidebar.title("⚡ Invoice Sentinel Lite")
+    st.sidebar.title("🛡️ Invoice Sentinel")
     st.sidebar.markdown("---")
-    page = st.sidebar.radio("Navigation", ["Dashboard", "Document Upload (PDF/DOCX)", "Reconciliation"])
-    st.sidebar.info("Mode: Fast Cloud Deploy\nNo Image OCR")
+    page = st.sidebar.radio("Navigation", ["Dashboard", "Data Ingestion", "Reconciliation"])
+    st.sidebar.markdown("---")
+    st.sidebar.info("Mode: Fast (CSV Only)")
     return page
 
 def page_dashboard():
     st.title("Executive Dashboard")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Processed Documents", "1,240", "+12%")
+    col1.metric("Processed Transactions", "1,240", "+12%")
     col2.metric("Discrepancies", "45", "-5%")
     col3.metric("Fraud Alerts", "8", "High Risk", delta_color="inverse")
     col4.metric("Value at Risk", "₹ 12,45,000", "Alert")
+    
     st.markdown("---")
     c1, c2 = st.columns(2)
     with c1:
@@ -234,112 +196,134 @@ def page_dashboard():
         st.plotly_chart(fig2, use_container_width=True)
 
 def page_entry():
-    st.title("Document Ingestion (PDF/Word/CSV)")
+    st.title("Data Ingestion")
     
-    tab1, tab2 = st.tabs(["📄 Document Parser", "📂 CSV Batch Upload"])
+    tab1, tab2 = st.tabs(["📂 Batch CSV Upload", "✍️ Manual Entry"])
     
     with tab1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("Smart Document Parser (No Images)")
-        st.info("Upload PDF or Word files only.")
+        st.subheader("Bulk Processing (CSV)")
+        st.caption("Upload CSVs. System auto-cleans headers and sums line items.")
         
         c1, c2 = st.columns(2)
-        inv_files = c1.file_uploader("Upload Invoices (PDF/DOCX)", type=['pdf', 'docx', 'doc'], accept_multiple_files=True)
-        po_files = c2.file_uploader("Upload POs (PDF/DOCX)", type=['pdf', 'docx', 'doc'], accept_multiple_files=True)
-            
-        if st.button("🚀 Extract & Analyze"):
-            if not inv_files or not po_files:
-                st.error("Please upload at least one Invoice and one PO.")
-            else:
-                extracted_inv = []
-                for f in inv_files:
-                    raw_text = extract_text_from_file(f)
-                    if raw_text == "IMAGE_SKIPPED":
-                        st.warning(f"Skipped {f.name} (Image/OCR disabled in Lite Mode)")
-                        continue
-                    data = smart_parse_text(raw_text, 'invoice')
-                    data['Source_File'] = f.name
-                    extracted_inv.append(data)
-                
-                extracted_po = []
-                for f in po_files:
-                    raw_text = extract_text_from_file(f)
-                    data = smart_parse_text(raw_text, 'po')
-                    data['Source_File'] = f.name
-                    extracted_po.append(data)
-                
-                if extracted_inv and extracted_po:
-                    df_inv = pd.DataFrame(extracted_inv)
-                    df_po = pd.DataFrame(extracted_po)
-                    st.session_state['df_inv'] = df_inv
-                    st.session_state['df_po'] = df_po
-                    st.success("Extraction Complete!")
-                    st.write("Invoices:", df_inv.head())
-                    st.write("POs:", df_po.head())
-                else:
-                    st.error("No valid text found in documents.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with tab2:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("Legacy CSV Upload")
-        c1, c2 = st.columns(2)
-        inv_files = c1.file_uploader("Upload Invoice CSVs", type=['csv'], accept_multiple_files=True, key='csv_inv')
-        po_files = c2.file_uploader("Upload PO CSVs", type=['csv'], accept_multiple_files=True, key='csv_po')
+        inv_files = c1.file_uploader("Upload Invoice CSVs", type=['csv'], accept_multiple_files=True, key="inv_up")
+        po_files = c2.file_uploader("Upload PO CSVs", type=['csv'], accept_multiple_files=True, key="po_up")
         
         if inv_files and po_files:
             try:
                 df_inv = pd.concat((pd.read_csv(f, encoding='utf-8-sig') for f in inv_files), ignore_index=True)
                 df_po = pd.concat((pd.read_csv(f, encoding='utf-8-sig') for f in po_files), ignore_index=True)
+                
                 df_inv = clean_dataframe(df_inv, 'invoice')
                 df_po = clean_dataframe(df_po, 'po')
                 
-                if 'Invoice_ID' in df_inv.columns and df_inv['Invoice_ID'].duplicated().any():
-                     if 'Amount' in df_inv.columns:
-                        try:
-                            df_inv['Amount'] = df_inv['Amount'].astype(str).str.replace(',', '').astype(float)
-                            cols = ['Invoice_ID', 'PO_Number', 'Vendor']
-                            available_cols = [c for c in cols if c in df_inv.columns]
-                            df_inv = df_inv.groupby(available_cols, as_index=False)['Amount'].sum()
-                        except: pass
-
-                st.session_state['df_inv'] = df_inv
-                st.session_state['df_po'] = df_po
-                st.success(f"CSVs Loaded & Cleaned.")
+                df_inv = process_uploaded_data(df_inv, 'Invoice_ID', 'Invoice')
+                df_po = process_uploaded_data(df_po, 'PO_Number', 'PO')
+                
+                if not df_inv.empty and not df_po.empty:
+                    st.success(f"✅ Loaded: {len(df_inv)} Invoices and {len(df_po)} POs.")
+                    if st.button("Save & Proceed to Analysis", key="btn_upload"):
+                        st.session_state['df_inv'] = df_inv
+                        st.session_state['df_po'] = df_po
+                        st.success("Data Saved!")
             except Exception as e:
-                st.error(f"CSV Error: {e}")
+                st.error(f"Error processing file: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
+
+    with tab2:
+        st.markdown("### Supplier & Vendor Relationship Entry")
+        col_inv, col_po = st.columns(2)
+        
+        with col_inv:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.subheader("📄 Vendor Invoice (Supplier)")
+            inv_num = st.text_input("Invoice Number", value="INV-2024-001")
+            inv_ref_po = st.text_input("Reference PO #", value="PO-998877")
+            inv_vendor = st.text_input("Vendor Name", value="Acme Corp")
+            inv_date = st.date_input("Invoice Date", key="date_inv")
+            
+            st.markdown("**Line Items**")
+            inv_data = {'Product Name': ['Industrial Motor'], 'Quantity': [2], 'Unit Price (₹)': [25000.0]}
+            inv_df_input = pd.DataFrame(inv_data)
+            edited_inv = st.data_editor(inv_df_input, num_rows="dynamic", key="editor_inv")
+            
+            if not edited_inv.empty:
+                edited_inv['Line Total'] = edited_inv['Quantity'] * edited_inv['Unit Price (₹)']
+                inv_total = edited_inv['Line Total'].sum()
+            else:
+                inv_total = 0.0
+            st.metric("Total Invoice Value", f"₹ {inv_total:,.2f}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col_po:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.subheader("🏢 Internal Purchase Order (Buyer)")
+            po_num = st.text_input("PO Number", value="PO-998877")
+            po_vendor = st.text_input("Supplier Name", value="Acme Corp")
+            po_date = st.date_input("PO Date", key="date_po")
+            
+            st.markdown("**Line Items**")
+            po_data = {'Product Name': ['Industrial Motor'], 'Quantity': [2], 'Unit Price (₹)': [25000.0]}
+            po_df_input = pd.DataFrame(po_data)
+            edited_po = st.data_editor(po_df_input, num_rows="dynamic", key="editor_po")
+            
+            if not edited_po.empty:
+                edited_po['Line Total'] = edited_po['Quantity'] * edited_po['Unit Price (₹)']
+                po_total = edited_po['Line Total'].sum()
+            else:
+                po_total = 0.0
+            st.metric("Total PO Value", f"₹ {po_total:,.2f}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("---")
+        if st.button("Submit & Run Reconciliation", type="primary"):
+            try:
+                txn_inv = Transaction(type='INVOICE', ref_number=inv_num, vendor_name=inv_vendor, total_amount=float(inv_total), date=str(inv_date), status='Pending')
+                session.add(txn_inv)
+                txn_po = Transaction(type='PO', ref_number=po_num, vendor_name=po_vendor, total_amount=float(po_total), date=str(po_date), status='Created')
+                session.add(txn_po)
+                session.commit()
+                
+                df_manual_inv = pd.DataFrame([{'Invoice_ID': inv_num, 'PO_Number': inv_ref_po, 'Vendor': inv_vendor, 'Amount': inv_total}])
+                df_manual_po = pd.DataFrame([{'PO_Number': po_num, 'Vendor': po_vendor, 'Amount': po_total}])
+                
+                st.session_state['df_inv'] = df_manual_inv
+                st.session_state['df_po'] = df_manual_po
+                st.success("Transaction Saved! Data loaded for Analysis.")
+            except Exception as e:
+                st.error(f"Database Error: {e}")
 
 def page_analysis():
     st.title("Reconciliation & Analysis")
     if 'df_inv' not in st.session_state or 'df_po' not in st.session_state:
-        st.warning("No data found. Please upload documents first.")
+        st.warning("No data found. Please upload files or enter data manually.")
         return
+
     df_inv = st.session_state['df_inv']
     df_po = st.session_state['df_po']
-    st.markdown("### Step 1: Matching Results")
+
+    st.markdown("### Step 1: Rule-Based Matching")
     if st.button("Run Matching Engine"):
-        matched = match_logic_only(df_inv, df_po)
-        if not matched.empty:
-            st.session_state['matched'] = matched
-            def color_status(val):
-                color = 'green' if val == 'Matched' else 'red'
-                return f'color: {color}; font-weight: bold'
-            st.dataframe(matched.style.applymap(color_status, subset=['Match_Status']))
-        else:
-            st.warning("No matches found.")
+        matched_results = match_logic_only(df_inv, df_po)
+        st.session_state['matched_results'] = matched_results
+        
+        st.write(f"Processed {len(matched_results)} transactions.")
+        def color_status(val):
+            color = 'green' if val == 'Matched' else 'red'
+            return f'color: {color}; font-weight: bold'
+        st.dataframe(matched_results.style.applymap(color_status, subset=['Match_Status']))
 
     st.markdown("---")
     st.markdown("### Step 2: AI Fraud Detection")
-    if 'matched' in st.session_state:
+    if 'matched_results' in st.session_state:
         if st.button("Run Anomaly Detection"):
-            analyzed = anomaly_logic_only(st.session_state['matched'])
-            st.write(analyzed)
+            analyzed_data = anomaly_logic_only(st.session_state['matched_results'])
+            st.write(analyzed_data)
 
 def main():
     page = sidebar_nav()
     if page == "Dashboard": page_dashboard()
-    elif page == "Document Upload (PDF/DOCX)": page_entry()
+    elif page == "Data Ingestion": page_entry()
     elif page == "Reconciliation": page_analysis()
 
 if __name__ == "__main__":
