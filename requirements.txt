@@ -7,5 +7,4 @@ sqlalchemy
 thefuzz
 pdfplumber
 python-docx
-Pillow
 python-multipart
