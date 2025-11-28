@@ -8,5 +8,4 @@ thefuzz
 pdfplumber
 python-docx
 Pillow
-pytesseract
 python-multipart
