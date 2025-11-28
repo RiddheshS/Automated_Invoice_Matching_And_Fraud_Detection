@@ -5,6 +5,4 @@ scikit-learn
 plotly
 sqlalchemy
 thefuzz
-pdfplumber
-python-docx
 python-multipart
